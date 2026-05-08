@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 
@@ -43,6 +44,13 @@ import (
 
 const (
 	ephemeralRunnerSetFinalizerName = "ephemeralrunner.actions.github.com/finalizer"
+
+	// provisioningHeadroom is the number of runners we allow to be created beyond
+	// the current eligible node count. This gives the cluster autoscaler something
+	// to react to when no nodes exist yet (bootstrap) or when there is still room
+	// to grow. Once CAS fails to provision (e.g. GCE out of resources), no new
+	// nodes appear and the headroom is consumed, stopping further creation.
+	provisioningHeadroom = 1
 )
 
 // EphemeralRunnerSetReconciler reconciles a EphemeralRunnerSet object
@@ -61,6 +69,7 @@ type EphemeralRunnerSetReconciler struct {
 // +kubebuilder:rbac:groups=actions.github.com,resources=ephemeralrunnersets/finalizers,verbs=update;patch
 // +kubebuilder:rbac:groups=actions.github.com,resources=ephemeralrunners,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=actions.github.com,resources=ephemeralrunners/status,verbs=get
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -205,6 +214,22 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 		switch {
 		case total < ephemeralRunnerSet.Spec.Replicas: // Handle scale up
 			count := ephemeralRunnerSet.Spec.Replicas - total
+			nodeCount, err := r.countEligibleNodesForPod(ctx, &ephemeralRunnerSet.Spec.EphemeralRunnerSpec.Spec, log)
+			if err != nil {
+				log.Error(err, "failed to count eligible nodes, proceeding without capacity check")
+			} else {
+				// eligible nodes (Ready or NotReady/initializing) + headroom so CAS has
+				// pending pods to react to, minus runners already created.
+				available := nodeCount + provisioningHeadroom - total
+				if available <= 0 {
+					log.Info("No node capacity available, skipping scale up", "eligibleNodes", nodeCount, "existingRunners", total)
+					break
+				}
+				if available < count {
+					log.Info("Clamping scale up to available node capacity", "requested", count, "available", available, "eligibleNodes", nodeCount)
+					count = available
+				}
+			}
 			log.Info("Creating new ephemeral runners (scale up)", "count", count)
 			if err := r.createEphemeralRunners(ctx, ephemeralRunnerSet, count, log); err != nil {
 				log.Error(err, "failed to make ephemeral runner")
@@ -627,4 +652,100 @@ func (s *ephemeralRunnersByState) terminated() []*v1alpha1.EphemeralRunner {
 
 func (s *ephemeralRunnersByState) scaleTotal() int {
 	return len(s.pending) + len(s.running) + len(s.failed)
+}
+
+// countEligibleNodesForPod counts nodes that satisfy the pod's required node affinity
+// and are not cordoned or being deleted. Both Ready and NotReady nodes are counted:
+// NotReady nodes are typically being initialised by the cluster autoscaler, so they
+// represent capacity that will become available shortly. Counting them prevents the
+// chicken-and-egg problem where CAS needs a pending pod before it will provision a
+// node, but we would never create a pod because no nodes are ready yet.
+//
+// The caller adds provisioningHeadroom on top of this count so that at least one
+// runner is always created beyond confirmed node capacity, giving CAS something to
+// react to. When CAS fails (e.g. GCE out of resources), no new nodes appear, the
+// headroom is quickly consumed, and further creation is suppressed.
+func (r *EphemeralRunnerSetReconciler) countEligibleNodesForPod(ctx context.Context, podSpec *corev1.PodSpec, log logr.Logger) (int, error) {
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList); err != nil {
+		return 0, fmt.Errorf("failed to list nodes: %w", err)
+	}
+
+	required := requiredNodeAffinity(podSpec)
+
+	count := 0
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		if !nodeIsEligible(node) {
+			continue
+		}
+		if required != nil && !nodeMatchesAffinityTerms(node, required) {
+			continue
+		}
+		count++
+	}
+
+	log.Info("Counted eligible nodes for runner pod", "count", count)
+	return count, nil
+}
+
+func requiredNodeAffinity(podSpec *corev1.PodSpec) []corev1.NodeSelectorTerm {
+	if podSpec.Affinity == nil {
+		return nil
+	}
+	if podSpec.Affinity.NodeAffinity == nil {
+		return nil
+	}
+	required := podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil || len(required.NodeSelectorTerms) == 0 {
+		return nil
+	}
+	return required.NodeSelectorTerms
+}
+
+// nodeIsEligible returns true for nodes that are not being deleted and not cordoned.
+// It intentionally accepts NotReady nodes because the cluster autoscaler sets a node
+// up in Kubernetes before the kubelet finishes initialising it; counting those nodes
+// lets us give CAS credit for capacity it has already claimed from the cloud provider.
+func nodeIsEligible(node *corev1.Node) bool {
+	if !node.DeletionTimestamp.IsZero() {
+		return false
+	}
+	return !node.Spec.Unschedulable
+}
+
+// nodeMatchesAffinityTerms returns true if the node satisfies at least one NodeSelectorTerm
+// (terms are ORed; expressions within a term are ANDed).
+func nodeMatchesAffinityTerms(node *corev1.Node, terms []corev1.NodeSelectorTerm) bool {
+	for _, term := range terms {
+		if nodeSelectorTermMatches(node, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func nodeSelectorTermMatches(node *corev1.Node, term corev1.NodeSelectorTerm) bool {
+	for _, expr := range term.MatchExpressions {
+		if !nodeSelectorRequirementMatches(node.Labels, expr) {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeSelectorRequirementMatches(labels map[string]string, req corev1.NodeSelectorRequirement) bool {
+	val, exists := labels[req.Key]
+	switch req.Operator {
+	case corev1.NodeSelectorOpIn:
+		return exists && slices.Contains(req.Values, val)
+	case corev1.NodeSelectorOpNotIn:
+		return !exists || !slices.Contains(req.Values, val)
+	case corev1.NodeSelectorOpExists:
+		return exists
+	case corev1.NodeSelectorOpDoesNotExist:
+		return !exists
+	default:
+		return true
+	}
 }
