@@ -82,3 +82,35 @@ rules:
   - list
   - watch
 {{- end }}
+{{- if .Values.flags.watchSingleNamespace }}
+---
+# Nodes are cluster-scoped and cannot be bound through a namespaced Role.
+# This ClusterRole grants the minimum read access the EphemeralRunnerSet controller
+# needs to gate runner creation on available node capacity.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gha-runner-scale-set-controller.managerClusterRoleName" . }}-nodes
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gha-runner-scale-set-controller.managerClusterRoleName" . }}-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "gha-runner-scale-set-controller.managerClusterRoleName" . }}-nodes
+subjects:
+- kind: ServiceAccount
+  name: {{ include "gha-runner-scale-set-controller.serviceAccountName" . }}
+  namespace: {{ include "gha-runner-scale-set-controller.namespace" . }}
+{{- end }}

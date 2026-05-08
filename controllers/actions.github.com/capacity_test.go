@@ -91,7 +91,7 @@ func TestNodeMatchesAffinityTerms(t *testing.T) {
 		{"no match", otherLabels, false},
 		{"matches first term (gke-nodepool=gpu1)", map[string]string{"cloud.google.com/gke-nodepool": "gpu1"}, true},
 		{"matches both terms", map[string]string{
-			"cloud.google.com/gke-nodepool":   "gpu1",
+			"cloud.google.com/gke-nodepool":  "gpu1",
 			"cloud.google.com/compute-class": "gpu1",
 		}, true},
 	}
