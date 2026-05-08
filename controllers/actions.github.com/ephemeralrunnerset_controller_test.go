@@ -1093,6 +1093,172 @@ var _ = Describe("Test EphemeralRunnerSet controller", func() {
 			).Should(BeEquivalentTo(desiredStatus), "Status is not eventually updated to the desired one")
 		})
 	})
+
+	It("Should gate EphemeralRunner creation to matching node count + headroom", func() {
+		// This test verifies the capacity-gating logic introduced to prevent
+		// over-claiming GitHub jobs when the cluster autoscaler cannot provision
+		// additional GPU nodes (e.g. GCE out of resources in the region).
+		//
+		// The runner pod carries required node affinity for compute-class=gpu1.
+		// With 2 matching nodes and provisioningHeadroom=1 we expect at most 3
+		// runners regardless of how many replicas are desired.
+
+		gpuAffinity := corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "cloud.google.com/compute-class",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"gpu1"},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		gpuRunnerSet := &v1alpha1.EphemeralRunnerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-gpu-capacity",
+				Namespace: autoscalingNS.Name,
+			},
+			Spec: v1alpha1.EphemeralRunnerSetSpec{
+				Replicas: 10,
+				EphemeralRunnerSpec: v1alpha1.EphemeralRunnerSpec{
+					GitHubConfigUrl:    "https://github.com/owner/repo",
+					GitHubConfigSecret: configSecret.Name,
+					RunnerScaleSetID:   200,
+					PodTemplateSpec: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Affinity: &gpuAffinity,
+							Containers: []corev1.Container{
+								{
+									Name:  "runner",
+									Image: "ghcr.io/actions/runner",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		makeGPUNode := func(name string) *corev1.Node {
+			return &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: name,
+					Labels: map[string]string{
+						"cloud.google.com/compute-class": "gpu1",
+					},
+				},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+					},
+				},
+			}
+		}
+
+		node1 := makeGPUNode("gpu-node-1")
+		node2 := makeGPUNode("gpu-node-2")
+		Expect(k8sClient.Create(ctx, node1)).To(Succeed())
+		Expect(k8sClient.Create(ctx, node2)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, node1)
+			_ = k8sClient.Delete(ctx, node2)
+		})
+
+		Expect(k8sClient.Create(ctx, gpuRunnerSet)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, gpuRunnerSet)
+		})
+
+		// With 2 GPU nodes and headroom=1, exactly 3 runners should be created
+		// (never 10, even though Replicas=10).
+		Eventually(
+			func() (int, error) {
+				runnerList := new(v1alpha1.EphemeralRunnerList)
+				if err := listEphemeralRunnersAndRemoveFinalizers(ctx, k8sClient, runnerList, autoscalingNS.Name); err != nil {
+					return -1, err
+				}
+				// filter to only the runners owned by this runner set
+				count := 0
+				for _, r := range runnerList.Items {
+					for _, ref := range r.OwnerReferences {
+						if ref.Name == gpuRunnerSet.Name {
+							count++
+							break
+						}
+					}
+				}
+				return count, nil
+			},
+			ephemeralRunnerSetTestTimeout,
+			ephemeralRunnerSetTestInterval,
+		).Should(BeEquivalentTo(3), "should create exactly node_count + headroom = 3 runners")
+
+		Consistently(
+			func() (int, error) {
+				runnerList := new(v1alpha1.EphemeralRunnerList)
+				if err := listEphemeralRunnersAndRemoveFinalizers(ctx, k8sClient, runnerList, autoscalingNS.Name); err != nil {
+					return -1, err
+				}
+				count := 0
+				for _, r := range runnerList.Items {
+					for _, ref := range r.OwnerReferences {
+						if ref.Name == gpuRunnerSet.Name {
+							count++
+							break
+						}
+					}
+				}
+				return count, nil
+			},
+			5*time.Second,
+			ephemeralRunnerSetTestInterval,
+		).Should(BeEquivalentTo(3), "runner count should not exceed node_count + headroom")
+
+		// Add a third GPU node — the controller should create one more runner.
+		// We also patch the EphemeralRunnerSet to trigger an immediate reconcile, since
+		// the controller does not watch Nodes directly; without this the reconcile would
+		// only happen after the 30s capacityConstrainedRequeueInterval fires.
+		node3 := makeGPUNode("gpu-node-3")
+		Expect(k8sClient.Create(ctx, node3)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node3) })
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(gpuRunnerSet), gpuRunnerSet)).To(Succeed())
+		Expect(patch(ctx, k8sClient, gpuRunnerSet, func(rs *v1alpha1.EphemeralRunnerSet) {
+			if rs.Labels == nil {
+				rs.Labels = map[string]string{}
+			}
+			rs.Labels["test-trigger"] = "node3-added"
+		})).To(Succeed())
+
+		Eventually(
+			func() (int, error) {
+				runnerList := new(v1alpha1.EphemeralRunnerList)
+				if err := listEphemeralRunnersAndRemoveFinalizers(ctx, k8sClient, runnerList, autoscalingNS.Name); err != nil {
+					return -1, err
+				}
+				count := 0
+				for _, r := range runnerList.Items {
+					for _, ref := range r.OwnerReferences {
+						if ref.Name == gpuRunnerSet.Name {
+							count++
+							break
+						}
+					}
+				}
+				return count, nil
+			},
+			ephemeralRunnerSetTestTimeout,
+			ephemeralRunnerSetTestInterval,
+		).Should(BeEquivalentTo(4), "adding a node should allow one more runner to be created")
+	})
 })
 
 var _ = Describe("Test EphemeralRunnerSet controller with proxy settings", func() {

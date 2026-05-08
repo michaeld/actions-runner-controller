@@ -23,6 +23,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
 	"github.com/actions/actions-runner-controller/controllers/actions.github.com/metrics"
@@ -51,6 +52,12 @@ const (
 	// to grow. Once CAS fails to provision (e.g. GCE out of resources), no new
 	// nodes appear and the headroom is consumed, stopping further creation.
 	provisioningHeadroom = 1
+
+	// capacityConstrainedRequeueInterval is how often to re-check node capacity
+	// when a scale-up was suppressed or clamped by the capacity gate. Without this,
+	// a newly provisioned node would only be noticed when an unrelated event triggers
+	// reconciliation.
+	capacityConstrainedRequeueInterval = 30 * time.Second
 )
 
 // EphemeralRunnerSetReconciler reconciles a EphemeralRunnerSet object
@@ -62,6 +69,10 @@ type EphemeralRunnerSetReconciler struct {
 	PublishMetrics bool
 
 	ResourceBuilder
+
+	// NodeReader bypasses the namespace-scoped cache for cluster-scoped Node reads.
+	// Set to mgr.GetAPIReader() on construction; falls back to the same in SetupWithManager.
+	NodeReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=actions.github.com,resources=ephemeralrunnersets,verbs=get;list;watch;create;update;patch;delete
@@ -204,6 +215,7 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	total := ephemeralRunnersByState.scaleTotal()
+	capacityConstrained := false
 	if ephemeralRunnerSet.Spec.PatchID == 0 || ephemeralRunnerSet.Spec.PatchID != ephemeralRunnersByState.latestPatchID {
 		defer func() {
 			if err := r.cleanupFinishedEphemeralRunners(ctx, ephemeralRunnersByState.finished, log); err != nil {
@@ -217,17 +229,21 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 			nodeCount, err := r.countEligibleNodesForPod(ctx, &ephemeralRunnerSet.Spec.EphemeralRunnerSpec.Spec, log)
 			if err != nil {
 				log.Error(err, "failed to count eligible nodes, proceeding without capacity check")
-			} else {
+			} else if nodeCount >= 0 {
+				// nodeCount >= 0 means the pod has required node affinity, so the number
+				// of matching nodes is a meaningful capacity bound. Apply the gate:
 				// eligible nodes (Ready or NotReady/initializing) + headroom so CAS has
 				// pending pods to react to, minus runners already created.
 				available := nodeCount + provisioningHeadroom - total
 				if available <= 0 {
 					log.Info("No node capacity available, skipping scale up", "eligibleNodes", nodeCount, "existingRunners", total)
+					capacityConstrained = true
 					break
 				}
 				if available < count {
 					log.Info("Clamping scale up to available node capacity", "requested", count, "available", available, "eligibleNodes", nodeCount)
 					count = available
+					capacityConstrained = true
 				}
 			}
 			log.Info("Creating new ephemeral runners (scale up)", "count", count)
@@ -258,7 +274,11 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
-	return ctrl.Result{}, r.updateStatus(ctx, ephemeralRunnerSet, ephemeralRunnersByState, log)
+	var requeueAfter time.Duration
+	if capacityConstrained {
+		requeueAfter = capacityConstrainedRequeueInterval
+	}
+	return ctrl.Result{RequeueAfter: requeueAfter}, r.updateStatus(ctx, ephemeralRunnerSet, ephemeralRunnersByState, log)
 }
 
 func (r *EphemeralRunnerSetReconciler) updateStatus(ctx context.Context, ephemeralRunnerSet *v1alpha1.EphemeralRunnerSet, state *ephemeralRunnersByState, log logr.Logger) error {
@@ -548,6 +568,9 @@ func (r *EphemeralRunnerSetReconciler) deleteEphemeralRunnerWithActionsClient(ct
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *EphemeralRunnerSetReconciler) SetupWithManager(mgr ctrl.Manager, opts ...Option) error {
+	if r.NodeReader == nil {
+		r.NodeReader = mgr.GetAPIReader()
+	}
 	return builderWithOptions(
 		ctrl.NewControllerManagedBy(mgr).
 			For(&v1alpha1.EphemeralRunnerSet{}).
@@ -661,17 +684,24 @@ func (s *ephemeralRunnersByState) scaleTotal() int {
 // chicken-and-egg problem where CAS needs a pending pod before it will provision a
 // node, but we would never create a pod because no nodes are ready yet.
 //
+// Returns -1 when the pod has no required node affinity, signalling that capacity
+// gating does not apply (any node can run the pod, so we don't restrict creation).
+//
 // The caller adds provisioningHeadroom on top of this count so that at least one
 // runner is always created beyond confirmed node capacity, giving CAS something to
 // react to. When CAS fails (e.g. GCE out of resources), no new nodes appear, the
 // headroom is quickly consumed, and further creation is suppressed.
 func (r *EphemeralRunnerSetReconciler) countEligibleNodesForPod(ctx context.Context, podSpec *corev1.PodSpec, log logr.Logger) (int, error) {
-	nodeList := &corev1.NodeList{}
-	if err := r.List(ctx, nodeList); err != nil {
-		return 0, fmt.Errorf("failed to list nodes: %w", err)
+	required := requiredNodeAffinity(podSpec)
+	if required == nil {
+		// No required node affinity — the pod can run anywhere; skip capacity gating.
+		return -1, nil
 	}
 
-	required := requiredNodeAffinity(podSpec)
+	nodeList := &corev1.NodeList{}
+	if err := r.NodeReader.List(ctx, nodeList); err != nil {
+		return 0, fmt.Errorf("failed to list nodes: %w", err)
+	}
 
 	count := 0
 	for i := range nodeList.Items {
@@ -679,7 +709,7 @@ func (r *EphemeralRunnerSetReconciler) countEligibleNodesForPod(ctx context.Cont
 		if !nodeIsEligible(node) {
 			continue
 		}
-		if required != nil && !nodeMatchesAffinityTerms(node, required) {
+		if !nodeMatchesAffinityTerms(node, required) {
 			continue
 		}
 		count++
