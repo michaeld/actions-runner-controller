@@ -111,6 +111,16 @@ Added to `ephemeralrunnerset_controller.go` and reflected in:
 - `charts/gha-runner-scale-set-controller/templates/manager_cluster_role.yaml` (cluster mode)
 - `charts/gha-runner-scale-set-controller/templates/manager_single_namespace_controller_role.yaml` (single-namespace mode: separate `ClusterRole` + `ClusterRoleBinding` because nodes are cluster-scoped and cannot be granted by a namespaced `Role`)
 
+### Summary of key design decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Gate location | `EphemeralRunnerSet` controller | Sits upstream of the acknowledgment point; has a full cached K8s client; fits the reconcile loop naturally |
+| Node eligibility | `Ready` **and** `NotReady` | `NotReady` nodes are being initialised by CAS — they represent capacity that will shortly be available |
+| `provisioningHeadroom = 1` | Always allow one runner beyond confirmed node count | Gives CAS a pending pod to react to on bootstrap; headroom is consumed when CAS fails to provision |
+| No-affinity bypass | Skip gate when `RequiredDuringScheduling` is absent | No meaningful node-count bound exists for unrestricted pods |
+| `NodeReader` | `mgr.GetAPIReader()` | Bypasses the namespace-scoped cache for cluster-scoped Node reads |
+
 ## Consequences
 
 **Easier:**
