@@ -91,6 +91,30 @@ var _ = Describe("Test EphemeralRunnerSet controller", func() {
 			},
 		}
 
+		// Create generic worker nodes so the capacity gate allows up to 5 runners.
+		// Tests in this suite scale up to Replicas=5; with provisioningHeadroom=1
+		// we need at least 4 eligible nodes (4 + 1 = 5 available).
+		var workerNodes []*corev1.Node
+		for i := 1; i <= 4; i++ {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: fmt.Sprintf("worker-node-%s-%d", autoscalingNS.Name, i),
+				},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, node)).To(Succeed())
+			workerNodes = append(workerNodes, node)
+		}
+		DeferCleanup(func() {
+			for _, node := range workerNodes {
+				_ = k8sClient.Delete(ctx, node)
+			}
+		})
+
 		err = k8sClient.Create(ctx, ephemeralRunnerSet)
 		Expect(err).NotTo(HaveOccurred(), "failed to create EphemeralRunnerSet")
 

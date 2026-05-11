@@ -79,7 +79,7 @@ Before calling `createEphemeralRunners`, count nodes that:
 
 Both `Ready` and `NotReady` nodes are counted. `NotReady` nodes are typically being initialised by CAS and represent capacity that will become available shortly. This prevents the chicken-and-egg problem where CAS needs a pending pod to trigger provisioning, but we would never create one because no node is ready yet.
 
-Pods with **no required node affinity** bypass the gate entirely (the runner can land on any node; there is no meaningful node-count bound).
+When the pod has **no required node affinity**, all eligible nodes in the cluster are counted (the pod can land on any node). The gate still applies; the cluster-wide node count is the capacity bound.
 
 ### `provisioningHeadroom = 1`
 
@@ -118,7 +118,7 @@ Added to `ephemeralrunnerset_controller.go` and reflected in:
 | Gate location | `EphemeralRunnerSet` controller | Sits upstream of the acknowledgment point; has a full cached K8s client; fits the reconcile loop naturally |
 | Node eligibility | `Ready` **and** `NotReady` | `NotReady` nodes are being initialised by CAS — they represent capacity that will shortly be available |
 | `provisioningHeadroom = 1` | Always allow one runner beyond confirmed node count | Gives CAS a pending pod to react to on bootstrap; headroom is consumed when CAS fails to provision |
-| No-affinity bypass | Skip gate when `RequiredDuringScheduling` is absent | No meaningful node-count bound exists for unrestricted pods |
+| No-affinity behaviour | Count all cluster nodes when `RequiredDuringScheduling` is absent | Cluster-wide node count is the capacity bound for unrestricted pods |
 | `NodeReader` | `mgr.GetAPIReader()` | Bypasses the namespace-scoped cache for cluster-scoped Node reads |
 
 ## Consequences
@@ -129,6 +129,5 @@ Added to `ephemeralrunnerset_controller.go` and reflected in:
 - The `provisioningHeadroom` constant gives CAS the one pending pod it needs to bootstrap a new node pool without over-claiming.
 
 **Harder / trade-offs:**
-- Runners with no required node affinity are unaffected — the gate only applies when affinity constrains which nodes are eligible. Clusters relying solely on resource-based scheduling (no node affinity) still need a separate capacity check.
 - The node count is a coarse proxy for capacity. It does not account for existing pod resource requests or per-node allocatable limits. A node that is full but not cordoned will be counted as eligible. A more precise CPU/memory-based gate is a possible follow-up.
 - The 30-second requeue adds a small lag between a new node becoming available and the next batch of runners being created. In practice the listener will also patch `spec.replicas` on new job arrivals, so the effective lag is the minimum of the two.

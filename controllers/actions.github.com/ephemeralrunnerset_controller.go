@@ -229,11 +229,10 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 			nodeCount, err := r.countEligibleNodesForPod(ctx, &ephemeralRunnerSet.Spec.EphemeralRunnerSpec.Spec, log)
 			if err != nil {
 				log.Error(err, "failed to count eligible nodes, proceeding without capacity check")
-			} else if nodeCount >= 0 {
-				// nodeCount >= 0 means the pod has required node affinity, so the number
-				// of matching nodes is a meaningful capacity bound. Apply the gate:
-				// eligible nodes (Ready or NotReady/initializing) + headroom so CAS has
-				// pending pods to react to, minus runners already created.
+			} else {
+				// Gate on eligible node count (Ready or NotReady/initializing) plus
+				// headroom so CAS has pending pods to react to, minus already-created
+				// runners. Applies whether or not the pod has required node affinity.
 				available := nodeCount + provisioningHeadroom - total
 				if available <= 0 {
 					log.Info("No node capacity available, skipping scale up", "eligibleNodes", nodeCount, "existingRunners", total)
@@ -677,15 +676,16 @@ func (s *ephemeralRunnersByState) scaleTotal() int {
 	return len(s.pending) + len(s.running) + len(s.failed)
 }
 
-// countEligibleNodesForPod counts nodes that satisfy the pod's required node affinity
-// and are not cordoned or being deleted. Both Ready and NotReady nodes are counted:
+// countEligibleNodesForPod counts nodes that can schedule the runner pod and are
+// not cordoned or being deleted. Both Ready and NotReady nodes are counted:
 // NotReady nodes are typically being initialised by the cluster autoscaler, so they
 // represent capacity that will become available shortly. Counting them prevents the
 // chicken-and-egg problem where CAS needs a pending pod before it will provision a
 // node, but we would never create a pod because no nodes are ready yet.
 //
-// Returns -1 when the pod has no required node affinity, signalling that capacity
-// gating does not apply (any node can run the pod, so we don't restrict creation).
+// When the pod has required node affinity, only nodes matching those terms are
+// counted. When the pod has no required node affinity, all eligible nodes are
+// counted (the pod can land on any node in the cluster).
 //
 // The caller adds provisioningHeadroom on top of this count so that at least one
 // runner is always created beyond confirmed node capacity, giving CAS something to
@@ -693,10 +693,6 @@ func (s *ephemeralRunnersByState) scaleTotal() int {
 // headroom is quickly consumed, and further creation is suppressed.
 func (r *EphemeralRunnerSetReconciler) countEligibleNodesForPod(ctx context.Context, podSpec *corev1.PodSpec, log logr.Logger) (int, error) {
 	required := requiredNodeAffinity(podSpec)
-	if required == nil {
-		// No required node affinity — the pod can run anywhere; skip capacity gating.
-		return -1, nil
-	}
 
 	nodeList := &corev1.NodeList{}
 	if err := r.NodeReader.List(ctx, nodeList); err != nil {
@@ -709,7 +705,7 @@ func (r *EphemeralRunnerSetReconciler) countEligibleNodesForPod(ctx context.Cont
 		if !nodeIsEligible(node) {
 			continue
 		}
-		if !nodeMatchesAffinityTerms(node, required) {
+		if required != nil && !nodeMatchesAffinityTerms(node, required) {
 			continue
 		}
 		count++
